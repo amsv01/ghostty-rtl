@@ -39,6 +39,10 @@ pub const Shaper = struct {
     /// with glyph indices in the buffer.
     codepoints: std.ArrayList(Codepoint) = .empty,
 
+    /// Scratch space used by shapeRtl to compute cell spans. Reused
+    /// across shaping calls to avoid allocations.
+    cluster_buf: std.ArrayList(u32) = .empty,
+
     const Codepoint = struct {
         cluster: u32,
         codepoint: u32,
@@ -98,6 +102,7 @@ pub const Shaper = struct {
         self.cell_buf.deinit(self.alloc);
         self.alloc.free(self.hb_feats);
         self.codepoints.deinit(self.alloc);
+        self.cluster_buf.deinit(self.alloc);
     }
 
     pub fn endFrame(self: *const Shaper) void {
@@ -158,6 +163,11 @@ pub const Shaper = struct {
         // This is perhaps not true somewhere, but we currently assume it is true.
         // If it isn't true, I'd like to catch it and learn more.
         assert(info.len == pos.len);
+
+        // RTL runs are mirrored so that they render right-to-left within
+        // the cells they occupy. This has its own codepath because the
+        // cell assignment logic differs significantly from LTR.
+        if (run.direction == .rtl) return self.shapeRtl(run);
 
         // This keeps track of the current x and y offsets (sum of advances)
         // and the furthest cluster we've seen so far (max).
@@ -259,9 +269,117 @@ pub const Shaper = struct {
         return self.cell_buf.items;
     }
 
+    /// Shape an RTL run.
+    ///
+    /// HarfBuzz performs the Unicode bidi algorithm internally and emits
+    /// RTL text in visual order: the glyph stream is exactly what should
+    /// appear on screen from left to right (e.g. numbers inside RTL text
+    /// remain in left-to-right order). We therefore assign glyphs to
+    /// cells in stream order, so the run is laid out right-to-left
+    /// within the cells it occupies. The resulting cells are sorted by
+    /// ascending x since our renderers require strictly increasing x.
+    fn shapeRtl(self: *Shaper, run: font.shape.TextRun) ![]const font.shape.Cell {
+        const info = self.hb_buf.getGlyphInfos();
+        const pos = self.hb_buf.getGlyphPositions() orelse return error.HarfbuzzFailed;
+        assert(info.len == pos.len);
+
+        const n: u32 = run.cells;
+
+        self.cell_buf.clearRetainingCapacity();
+
+        // First pass: collect the distinct cell clusters in the glyph
+        // stream and sort them ascending. The number of grid cells a
+        // glyph covers (its span) is the distance to the next distinct
+        // cluster in logical order; e.g. a lam-alef ligature has a span
+        // of two because it consumed the codepoints of two cells.
+        self.cluster_buf.clearRetainingCapacity();
+        for (info) |info_v| {
+            const cluster = self.codepoints.items[info_v.cluster].cluster;
+            const items = self.cluster_buf.items;
+            if (items.len == 0 or items[items.len - 1] != cluster) {
+                try self.cluster_buf.append(self.alloc, cluster);
+            }
+        }
+        std.mem.sort(u32, self.cluster_buf.items, {}, std.sort.asc(u32));
+
+        // Second pass: assign cells in glyph stream order. Glyphs that
+        // share a cluster (e.g. a base letter and its combining marks)
+        // are assigned to the same cell.
+        var cursor: u32 = 0;
+        var last_cluster: u32 = std.math.maxInt(u32);
+        var base_x: u32 = 0;
+
+        // Pen position tracking for within-cell offsets. The glyph
+        // stream is in visual order so accumulated advances grow
+        // left-to-right across the mirrored run, same as LTR.
+        var pen_x: i32 = 0;
+        var cell_pen_x: i32 = 0;
+
+        for (info, pos) |info_v, pos_v| {
+            const index = info_v.cluster;
+            const cluster = self.codepoints.items[index].cluster;
+
+            if (cluster != last_cluster) {
+                // Look up our span: the distance to the next distinct
+                // cluster in logical (sorted) order.
+                const span: u32 = span: {
+                    for (self.cluster_buf.items, 0..) |c, i| {
+                        if (c == cluster) {
+                            break :span if (i + 1 < self.cluster_buf.items.len)
+                                self.cluster_buf.items[i + 1] - c
+                            else
+                                n - c;
+                        }
+                    }
+                    break :span 1;
+                };
+
+                base_x = cursor;
+                cursor += span;
+                last_cluster = cluster;
+                cell_pen_x = pen_x;
+            }
+
+            // Under both FreeType and CoreText the harfbuzz scale is
+            // in 26.6 fixed point units, so we round to the nearest
+            // whole value here.
+            const x_offset = pen_x - cell_pen_x + ((pos_v.x_offset + 0b100_000) >> 6);
+            const y_offset = (pos_v.y_offset + 0b100_000) >> 6;
+
+            try self.cell_buf.append(self.alloc, .{
+                .x = @intCast(base_x),
+                .x_offset = @intCast(x_offset),
+                .y_offset = @intCast(y_offset),
+                .glyph_index = info_v.codepoint,
+            });
+
+            pen_x += (pos_v.x_advance + 0b100_000) >> 6;
+        }
+
+        // Guarantee ascending x for the renderer. Our assigned positions
+        // are already ascending by construction so this is just a cheap
+        // safety net for pathological shaping results.
+        std.mem.sort(
+            font.shape.Cell,
+            self.cell_buf.items,
+            {},
+            struct {
+                fn lt(_: void, a: font.shape.Cell, b: font.shape.Cell) bool {
+                    return a.x < b.x;
+                }
+            }.lt,
+        );
+
+        return self.cell_buf.items;
+    }
+
     /// The hooks for RunIterator.
     pub const RunIteratorHook = struct {
         shaper: *Shaper,
+
+        /// The strong direction of the current run, set by the run
+        /// iterator before calling prepare.
+        direction: unicode.bidi.Direction = .ltr,
 
         pub fn prepare(self: RunIteratorHook) void {
             // Reset the buffer for our current run
@@ -275,10 +393,15 @@ pub const Shaper = struct {
 
             self.shaper.codepoints.clearRetainingCapacity();
 
-            // We don't support RTL text because RTL in terminals is messy.
-            // Its something we want to improve. For now, we force LTR because
-            // our renderers assume a strictly increasing X value.
-            self.shaper.hb_buf.setDirection(.ltr);
+            // Set the buffer direction to match the run. RTL runs are
+            // shaped with an RTL direction so that HarfBuzz applies
+            // correct joining and bidi reordering; shapeRtl then
+            // mirrors the result into strictly increasing cell order
+            // for our renderers.
+            self.shaper.hb_buf.setDirection(switch (self.direction) {
+                .ltr => .ltr,
+                .rtl => .rtl,
+            });
         }
 
         pub fn addCodepoint(self: RunIteratorHook, cp: u32, cluster: u32) !void {
@@ -722,11 +845,12 @@ test "shape monaspace ligs" {
     }
 }
 
-// Ghostty doesn't currently support RTL and our renderers assume
-// that cells are in strict LTR order. This means that we need to
-// force RTL text to be LTR for rendering. This test ensures that
-// we are correctly forcing RTL text to be LTR.
-test "shape arabic forced LTR" {
+// Ghostty supports RTL text by segmenting runs by direction and
+// mirroring RTL runs within the cells they occupy. The renderers
+// still see cells in strict LTR order (ascending x). This test
+// ensures that Arabic text is detected as RTL and shaped into
+// ascending cell order.
+test "shape arabic RTL" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const io = testing.io;
@@ -754,17 +878,193 @@ test "shape arabic forced LTR" {
     while (try it.next(alloc)) |run| {
         count += 1;
         try testing.expectEqual(@as(usize, 25), run.cells);
+        try testing.expectEqual(unicode.bidi.Direction.rtl, run.direction);
 
         const cells = try shaper.shape(run);
-        try testing.expectEqual(@as(usize, 25), cells.len);
 
-        var x: u16 = cells[0].x;
-        for (cells[1..]) |cell| {
-            try testing.expectEqual(x + 1, cell.x);
-            x = cell.x;
+        // HarfBuzz forms ligatures (e.g. lam-alef) so we may have fewer
+        // glyphs than cells, but every glyph must be within the run's
+        // cell range and cells must be strictly ascending.
+        try testing.expect(cells.len > 0);
+        try testing.expectEqual(@as(u16, 0), cells[0].x);
+        for (cells[1..], 1..) |cell, i| {
+            try testing.expect(cell.x > cells[i - 1].x);
+            try testing.expect(cell.x < run.cells);
         }
     }
     try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "shape arabic RTL glyph order is mirrored" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // "سلام" (salaam): four Arabic letters in logical order.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("سلام");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.rtl, run.direction);
+    try testing.expectEqual(@as(usize, 4), run.cells);
+
+    const cells = try shaper.shape(run);
+
+    // HarfBuzz forms the lam-alef ligature, so we get 3 glyphs for our
+    // 4 cells: م at x=0, the لا ligature at x=1 (spanning cells 1-2),
+    // and س at x=3. This also verifies mirroring: the leftmost cell
+    // holds the glyph for the LAST logical character (م) and the
+    // rightmost cell holds the glyph for the first (س).
+    try testing.expectEqual(@as(usize, 3), cells.len);
+    try testing.expectEqual(@as(u16, 0), cells[0].x);
+    try testing.expectEqual(@as(u16, 1), cells[1].x);
+    try testing.expectEqual(@as(u16, 3), cells[2].x);
+    try testing.expect(cells[0].glyph_index != cells[2].glyph_index);
+
+    try testing.expect((try it.next(alloc)) == null);
+}
+
+test "shape mixed bidi runs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 80, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("abc سلام def");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    // We expect three runs: LTR "abc ", RTL "سلام " (the trailing
+    // space is neutral and joins the RTL run), and LTR "def". Note
+    // that we must shape each run immediately after iterating it
+    // because runs share state with the shaper.
+    var run_i: usize = 0;
+    while (try it.next(alloc)) |run| {
+        const cells = try shaper.shape(run);
+        switch (run_i) {
+            0 => {
+                try testing.expectEqual(unicode.bidi.Direction.ltr, run.direction);
+                try testing.expectEqual(@as(u16, 0), run.offset);
+                try testing.expectEqual(@as(u16, 4), run.cells);
+                try testing.expectEqual(@as(usize, 4), cells.len);
+            },
+            1 => {
+                try testing.expectEqual(unicode.bidi.Direction.rtl, run.direction);
+                try testing.expectEqual(@as(u16, 4), run.offset);
+                try testing.expectEqual(@as(u16, 5), run.cells);
+                // Glyphs must be ascending and within the run's range.
+                try testing.expect(cells.len > 0);
+                for (cells[1..], 1..) |cell, i| {
+                    try testing.expect(cell.x > cells[i - 1].x);
+                    try testing.expect(cell.x < run.cells);
+                }
+            },
+            2 => {
+                try testing.expectEqual(unicode.bidi.Direction.ltr, run.direction);
+                try testing.expectEqual(@as(u16, 9), run.offset);
+                try testing.expectEqual(@as(u16, 3), run.cells);
+                try testing.expectEqual(@as(usize, 3), cells.len);
+            },
+            else => return error.TestExpectedEqual,
+        }
+        run_i += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), run_i);
+}
+
+test "shape RTL with persian digits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .cols = 80, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // "سلام ۲۵": RTL letters, a space, and two Persian digits. Digits
+    // are weak bidi characters and must remain in left-to-right order
+    // (۲۵ is twenty-five, not fifty-two), so they are segmented into
+    // their own LTR run.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("سلام ۲۵");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    // Two runs: RTL "سلام " and LTR "۲۵". Note that we must shape
+    // each run immediately after iterating it because runs share
+    // state with the shaper.
+    var run_i: usize = 0;
+    while (try it.next(alloc)) |run| {
+        const cells = try shaper.shape(run);
+        switch (run_i) {
+            0 => {
+                try testing.expectEqual(unicode.bidi.Direction.rtl, run.direction);
+                try testing.expectEqual(@as(u16, 0), run.offset);
+                try testing.expectEqual(@as(u16, 5), run.cells);
+                // Glyphs must be ascending and within the run's range.
+                try testing.expect(cells.len > 0);
+                for (cells[1..], 1..) |cell, i| {
+                    try testing.expect(cell.x > cells[i - 1].x);
+                    try testing.expect(cell.x < run.cells);
+                }
+            },
+            1 => {
+                // The digit run shapes LTR: ۲ then ۵ in logical order.
+                try testing.expectEqual(unicode.bidi.Direction.ltr, run.direction);
+                try testing.expectEqual(@as(u16, 5), run.offset);
+                try testing.expectEqual(@as(u16, 2), run.cells);
+                try testing.expectEqual(@as(usize, 2), cells.len);
+                try testing.expectEqual(@as(u16, 0), cells[0].x);
+                try testing.expectEqual(@as(u16, 1), cells[1].x);
+            },
+            else => return error.TestExpectedEqual,
+        }
+        run_i += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), run_i);
 }
 
 test "shape emoji width" {

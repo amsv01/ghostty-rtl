@@ -22,6 +22,11 @@ pub const bold_italic = @embedFile("jetbrains_mono_bold_italic");
 pub const emoji = @embedFile("res/NotoColorEmoji.ttf");
 pub const emoji_text = @embedFile("res/NotoEmoji-Regular.ttf");
 
+/// Vazirmatn variable font, used as a built-in fallback for Arabic
+/// script (including Persian/Farsi) text so that RTL text renders
+/// with a proper Persian typeface out of the box.
+pub const vazirmatn = @embedFile("res/Vazirmatn-VF.ttf");
+
 // Fonts below are ONLY used for testing.
 
 /// Fonts with general properties

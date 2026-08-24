@@ -602,7 +602,9 @@ pub fn add(
         .@"backend-osx" = target.result.os.tag == .macos,
         // OpenGL3 backend should only be built on non-Apple targets.
         // Apple platforms use Metal (and macOS may also use the OSX backend).
-        .@"backend-opengl3" = !target.result.os.tag.isDarwin(),
+        // The exception is the GTK runtime, which always uses OpenGL.
+        .@"backend-opengl3" = !target.result.os.tag.isDarwin() or
+            self.config.app_runtime == .gtk,
     })) |dep| {
         step.root_module.addImport("dcimgui", dep.module("dcimgui"));
         step.root_module.linkLibrary(dep.artifact("dcimgui"));

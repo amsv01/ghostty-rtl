@@ -3289,6 +3289,10 @@ fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
     var opts: input.key_encode.Options = .fromTerminal(t);
     if (comptime builtin.os.tag != .macos) return opts;
 
+    // The keyboard layout API is only available on the macOS-native
+    // (embedded/libghostty) runtime; GTK on macOS doesn't have it.
+    if (comptime @import("build_config.zig").app_runtime != .none) return opts;
+
     opts.macos_option_as_alt = self.config.macos_option_as_alt orelse detect: {
         // If we don't have alt pressed, it doesn't matter what this
         // config is so we can just say "false" and break out and avoid

@@ -1,6 +1,7 @@
 pub const lut = @import("lut.zig");
 
 const grapheme = @import("grapheme.zig");
+pub const bidi = @import("bidi.zig");
 pub const table = @import("props_table.zig").table;
 pub const Properties = @import("props.zig").Properties;
 pub const GraphemeWidthEffect = grapheme.GraphemeWidthEffect;

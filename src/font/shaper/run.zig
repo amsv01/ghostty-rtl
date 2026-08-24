@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const font = @import("../main.zig");
 const shape = @import("../shape.zig");
 const terminal = @import("../../terminal/main.zig");
+const bidi = @import("../../unicode/main.zig").bidi;
 const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 
@@ -30,6 +31,13 @@ pub const TextRun = struct {
 
     /// The total number of cells produced by this run.
     cells: u16,
+
+    /// The strong text direction of this run. Runs are segmented by
+    /// the run iterator so that a single run only ever contains one
+    /// strong direction (weak/neutral characters such as digits and
+    /// spaces join the surrounding run). RTL runs are mirrored by the
+    /// shaper so they render right-to-left within their cells.
+    direction: bidi.Direction = .ltr,
 
     /// The font grid that built this run.
     grid: *font.SharedGrid,
@@ -72,6 +80,35 @@ pub const RunIterator = struct {
         // Track the font for our current run
         var current_font: font.Collection.Index = .{};
 
+        // Determine the strong direction of this run by scanning ahead
+        // for the first strongly-directional codepoint. Weak and neutral
+        // codepoints (digits, spaces, punctuation) at the start of a run
+        // take on the direction of the text that follows them, so that
+        // e.g. a space before an Arabic word joins the RTL run.
+        const direction: bidi.Direction = direction: {
+            var scan: usize = self.i;
+            while (scan < max) : (scan += 1) {
+                const cell: *const terminal.page.Cell = &cells[scan];
+                switch (cell.wide) {
+                    .narrow, .wide => {},
+                    .spacer_head, .spacer_tail => continue,
+                }
+                if (cell.isEmpty() or cell.codepoint() == 0) continue;
+                const cp = cell.codepoint();
+                if (bidi.isRtl(cp)) break :direction .rtl;
+                // Any strong LTR codepoint ends our scan. We don't have
+                // a cheap strong-LTR test, so we approximate: codepoints
+                // below the first RTL block (Hebrew) that aren't digits,
+                // ASCII punctuation, or controls are treated as strong.
+                if (cp < 0x0590 and (cp >= 0x80 or std.ascii.isAlphabetic(@intCast(cp))))
+                    break :direction .ltr;
+            } else break :direction .ltr;
+        };
+
+        // Give the shaper hook our direction before preparing so it
+        // can set up any direction-dependent state.
+        self.hooks.direction = direction;
+
         // Allow the hook to prepare
         self.hooks.prepare();
 
@@ -104,6 +141,30 @@ pub const RunIterator = struct {
             switch (cell.wide) {
                 .narrow, .wide => {},
                 .spacer_head, .spacer_tail => continue,
+            }
+
+            // If the strong direction of the text changes, we break the
+            // run. Shaping RTL and LTR text in a single run would apply
+            // the wrong base direction to one of them, and our renderer
+            // mirrors RTL runs within their cells so they must be shaped
+            // separately. Weak/neutral codepoints never break a run.
+            if (j > self.i and !cell.isEmpty() and cell.codepoint() != 0) {
+                const cp = cell.codepoint();
+                if (bidi.isRtl(cp) != (direction == .rtl) and
+                    // Only break on strong characters; approximate strong
+                    // LTR the same way as the direction scan above.
+                    (bidi.isRtl(cp) or cp < 0x0590 and
+                        (cp >= 0x80 or std.ascii.isAlphabetic(@intCast(cp)))))
+                {
+                    break;
+                }
+
+                // Digit sequences are always laid out left-to-right,
+                // even inside RTL text (bidi classes EN/AN). We break
+                // them out of RTL runs into their own (LTR) runs so
+                // that numbers render in the correct order regardless
+                // of how much bidi support the shaper backend has.
+                if (direction == .rtl and bidi.isDigit(cp)) break;
             }
 
             // If our cell attributes are changing, then we split the run.
@@ -291,6 +352,10 @@ pub const RunIterator = struct {
         // Add our font index
         autoHash(&hasher, current_font);
 
+        // Add our direction, since LTR and RTL runs with otherwise
+        // identical content must not share cache entries.
+        autoHash(&hasher, direction);
+
         // Move our cursor. Must defer since we use self.i below.
         defer self.i = j;
 
@@ -298,6 +363,7 @@ pub const RunIterator = struct {
             .hash = hasher.final(),
             .offset = @intCast(self.i),
             .cells = @intCast(j - self.i),
+            .direction = direction,
             .grid = self.opts.grid,
             .font_index = current_font,
         };

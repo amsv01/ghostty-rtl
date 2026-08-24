@@ -206,6 +206,10 @@ pub const Shaper = struct {
     pub const RunIteratorHook = struct {
         shaper: *Shaper,
 
+        /// The strong direction of the current run, set by the run
+        /// iterator before calling prepare. Unused by this shaper.
+        direction: unicode.bidi.Direction = .ltr,
+
         pub fn prepare(self: RunIteratorHook) !void {
             // Reset the buffer for our current run
             self.shaper.run_buf.shrinkRetainingCapacity(0);

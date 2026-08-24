@@ -30,6 +30,8 @@ This project uses several fonts which fall under the SIL Open Font License (OFL-
   - [Copyright (c) 2011-2023 Tilman Blumenbach with Reserved Font Name "Terminus (TTF)"](https://files.ax86.net/terminus-ttf/)
 - Spleen (BSD 2-Clause)
   - [Copyright (c) 2018-2024, Frederic Cambus](https://github.com/fcambus/spleen)
+- Vazirmatn (OFL-1.1)
+  - [Copyright 2015 The Vazirmatn Project Authors (https://github.com/rastikerdar/vazirmatn)](https://github.com/rastikerdar/vazirmatn/blob/master/OFL.txt)
 
 A full copy of the OFL license can be found at [OFL.txt](./OFL.txt).
 An accompanying FAQ is also available at <https://openfontlicense.org/>.

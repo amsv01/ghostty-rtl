@@ -333,6 +333,42 @@ fn collection(
         },
     );
 
+    // Arabic script (including Persian/Farsi) fallback. We embed the
+    // Vazirmatn variable font so that RTL text renders with a proper
+    // Persian typeface out of the box, without requiring any fonts to
+    // be installed on the system. Since this is a loaded fallback face
+    // it takes priority over platform font discovery for the Arabic
+    // block. Bold is synthesized from the variable font's wght axis.
+    _ = try c.add(
+        self.alloc,
+        try .init(
+            self.font_lib,
+            font.embedded.vazirmatn,
+            load_options.faceOptions(),
+        ),
+        .{
+            .style = .regular,
+            .fallback = true,
+            .size_adjustment = font.default_fallback_adjustment,
+        },
+    );
+    try (try c.getFace(try c.add(
+        self.alloc,
+        try .init(
+            self.font_lib,
+            font.embedded.vazirmatn,
+            load_options.faceOptions(),
+        ),
+        .{
+            .style = .bold,
+            .fallback = true,
+            .size_adjustment = font.default_fallback_adjustment,
+        },
+    ))).setVariations(
+        &.{.{ .id = .init("wght"), .value = 700 }},
+        load_options.faceOptions(),
+    );
+
     // On macOS, always search for and add the Apple Emoji font
     // as our preferred emoji font for fallback. We do this in case
     // people add other emoji fonts to their system, we always want to

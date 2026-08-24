@@ -11,6 +11,7 @@ const SharedGrid = font.SharedGrid;
 const Style = font.Style;
 const Presentation = font.Presentation;
 const terminal = @import("../../terminal/main.zig");
+const unicode = @import("../../unicode/main.zig");
 
 const log = std.log.scoped(.font_shaper);
 
@@ -120,6 +121,10 @@ pub const Shaper = struct {
     /// The hooks for RunIterator.
     pub const RunIteratorHook = struct {
         shaper: *Shaper,
+
+        /// The strong direction of the current run, set by the run
+        /// iterator before calling prepare. Unused by this shaper.
+        direction: unicode.bidi.Direction = .ltr,
 
         pub fn prepare(self: *RunIteratorHook) !void {
             try self.shaper.run_state.reset();

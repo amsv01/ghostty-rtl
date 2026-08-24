@@ -57,6 +57,14 @@ pub const Shaper = struct {
     /// by just creating it once and saving it for reuse.
     typesetter_attr_dict: *macos.foundation.Dictionary,
 
+    /// Same as typesetter_attr_dict but with a forced RTL embedding
+    /// level, used for shaping RTL runs.
+    typesetter_attr_dict_rtl: *macos.foundation.Dictionary,
+
+    /// Scratch space used to compute cell spans when remapping RTL
+    /// runs. Reused across shaping calls to avoid allocations.
+    cluster_buf: std.ArrayListUnmanaged(u32) = .empty,
+
     /// List where we cache fonts, so we don't have to remake them for
     /// every single shaping operation.
     ///
@@ -202,6 +210,22 @@ pub const Shaper = struct {
         };
         errdefer typesetter_attr_dict.release();
 
+        // For RTL runs we force a right-to-left embedding level (1)
+        // instead. Our run iterator segments text by direction, so a
+        // run never contains strongly LTR text; weak characters such
+        // as spaces and punctuation take on the RTL direction which is
+        // what we want. Digits are segmented into their own LTR runs
+        // by the run iterator so their ordering is not affected.
+        const typesetter_attr_dict_rtl = dict: {
+            const num = try macos.foundation.Number.create(.int, &1);
+            defer num.release();
+            break :dict try macos.foundation.Dictionary.create(
+                &.{macos.c.kCTTypesetterOptionForcedEmbeddingLevel},
+                &.{num},
+            );
+        };
+        errdefer typesetter_attr_dict_rtl.release();
+
         // Create the CF release thread.
         var cf_release_thread = try alloc.create(CFReleaseThread);
         errdefer alloc.destroy(cf_release_thread);
@@ -223,6 +247,7 @@ pub const Shaper = struct {
             .features = features,
             .features_no_default = features_no_default,
             .typesetter_attr_dict = typesetter_attr_dict,
+            .typesetter_attr_dict_rtl = typesetter_attr_dict_rtl,
             .cached_fonts = .empty,
             .cached_font_grid = 0,
             .cf_release_pool = .empty,
@@ -237,6 +262,8 @@ pub const Shaper = struct {
         self.features.release();
         self.features_no_default.release();
         self.typesetter_attr_dict.release();
+        self.typesetter_attr_dict_rtl.release();
+        self.cluster_buf.deinit(self.alloc);
 
         {
             for (self.cached_fonts.items) |ft| {
@@ -371,12 +398,17 @@ pub const Shaper = struct {
         );
         self.cf_release_pool.appendAssumeCapacity(attr_str);
 
+        // True if this run is right-to-left. RTL runs are shaped with
+        // a forced RTL embedding level and remapped into visual order
+        // after shaping.
+        const rtl = run.direction == .rtl;
+
         // Create a typesetter from the attributed string and the cached
         // attr dict. (See comment in init for more info on the attr dict.)
         const typesetter =
             try macos.text.Typesetter.createWithAttributedStringAndOptions(
                 attr_str,
-                self.typesetter_attr_dict,
+                if (rtl) self.typesetter_attr_dict_rtl else self.typesetter_attr_dict,
             );
         self.cf_release_pool.appendAssumeCapacity(typesetter);
 
@@ -437,6 +469,23 @@ pub const Shaper = struct {
                 // Our cluster is also our cell X position. If the cluster changes
                 // then we need to reset our current cell offsets.
                 const cluster = state.codepoints.items[index].cluster;
+
+                // RTL runs are appended with their raw cluster and
+                // remapped into visual order after the loop. Within-cell
+                // x offsets are not computed because CoreText positions
+                // are absolute line positions that don't map cleanly to
+                // our mirrored grid cells; uniform monospace advances
+                // make this approximation exact in the common case.
+                if (rtl) {
+                    self.cell_buf.appendAssumeCapacity(.{
+                        .x = @intCast(cluster),
+                        .x_offset = 0,
+                        .y_offset = @intFromFloat(@round(position.y)),
+                        .glyph_index = glyph,
+                    });
+                    continue;
+                }
+
                 if (cell_offset.cluster != cluster) {
                     // We previously asserted that the new cluster is greater
                     // than cell_offset.cluster, but this isn't always true.
@@ -521,8 +570,55 @@ pub const Shaper = struct {
             }
         }
 
+        // For RTL runs, CoreText gives us glyphs in visual order (the
+        // order they appear on screen from left to right). We assign
+        // cells in stream order so the run is laid out right-to-left
+        // within the cells it occupies.
+        if (rtl) {
+            const n: u32 = run.cells;
+
+            // Collect the distinct clusters and sort them ascending so
+            // we can compute cell spans: the number of grid cells a
+            // glyph covers is the distance to the next distinct cluster
+            // in logical order (e.g. a lam-alef ligature spans two).
+            self.cluster_buf.clearRetainingCapacity();
+            for (self.cell_buf.items) |cell| {
+                const items = self.cluster_buf.items;
+                if (items.len == 0 or items[items.len - 1] != cell.x) {
+                    try self.cluster_buf.append(self.alloc, cell.x);
+                }
+            }
+            std.mem.sort(u32, self.cluster_buf.items, {}, std.sort.asc(u32));
+
+            // Assign cells in stream order. Glyphs that share a cluster
+            // (e.g. a base letter and its combining marks) are assigned
+            // to the same cell.
+            var cursor: u32 = 0;
+            var last_cluster: u32 = std.math.maxInt(u32);
+            var base_x: u32 = 0;
+            for (self.cell_buf.items) |*cell| {
+                if (cell.x != last_cluster) {
+                    const span: u32 = span: {
+                        for (self.cluster_buf.items, 0..) |c, i| {
+                            if (c == cell.x) {
+                                break :span if (i + 1 < self.cluster_buf.items.len)
+                                    self.cluster_buf.items[i + 1] - c
+                                else
+                                    n -| c;
+                            }
+                        }
+                        break :span 1;
+                    };
+                    base_x = cursor;
+                    cursor += span;
+                    last_cluster = cell.x;
+                }
+                cell.x = @intCast(base_x);
+            }
+        }
+
         // If our buffer contains some non-ltr sections we need to sort it :/
-        if (non_ltr) {
+        if (non_ltr or rtl) {
             // This is EXCEPTIONALLY rare. Only happens for languages with
             // complex shaping which we don't even really support properly
             // right now, so are very unlikely to be used heavily by users
@@ -644,6 +740,11 @@ pub const Shaper = struct {
     /// The hooks for RunIterator.
     pub const RunIteratorHook = struct {
         shaper: *Shaper,
+
+        /// The strong direction of the current run, set by the run
+        /// iterator before calling prepare. CoreText reads the
+        /// direction from the TextRun so this is only informational.
+        direction: unicode.bidi.Direction = .ltr,
 
         pub fn prepare(self: *RunIteratorHook) void {
             self.shaper.run_state.reset();
@@ -2516,6 +2617,163 @@ test "shape high plane sprite font codepoint" {
     try testing.expectEqual(null, try it.next(alloc));
 }
 
+test "shape arabic RTL" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // "سلام" (salaam): four Arabic letters in logical order.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("سلام");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    const run = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.rtl, run.direction);
+    try testing.expectEqual(@as(usize, 4), run.cells);
+    try testing.expect((try it.next(alloc)) == null);
+
+    const cells = try shaper.shape(run);
+
+    // CoreText forms the lam-alef ligature, so we get 3 glyphs for our
+    // 4 cells: م at x=0, the لا ligature at x=1 (spanning cells 1-2),
+    // and س at x=3. Cells must be ascending.
+    try testing.expectEqual(@as(usize, 3), cells.len);
+    try testing.expectEqual(@as(u16, 0), cells[0].x);
+    try testing.expectEqual(@as(u16, 1), cells[1].x);
+    try testing.expectEqual(@as(u16, 3), cells[2].x);
+}
+
+test "shape mixed bidi runs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 80, .rows = 3 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("abc سلام def");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    // We expect three runs: LTR "abc ", RTL "سلام " (the trailing
+    // space is neutral and joins the RTL run), and LTR "def".
+    const run1 = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.ltr, run1.direction);
+    try testing.expectEqual(@as(u16, 0), run1.offset);
+    try testing.expectEqual(@as(u16, 4), run1.cells);
+
+    const run2 = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.rtl, run2.direction);
+    try testing.expectEqual(@as(u16, 4), run2.offset);
+    try testing.expectEqual(@as(u16, 5), run2.cells);
+
+    const run3 = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.ltr, run3.direction);
+    try testing.expectEqual(@as(u16, 9), run3.offset);
+    try testing.expectEqual(@as(u16, 3), run3.cells);
+
+    try testing.expect((try it.next(alloc)) == null);
+
+    // The RTL run should shape into ascending cells within its own
+    // cell range. CoreText forms the lam-alef ligature and places the
+    // trailing space at the visual start of the run, so we get 4
+    // glyphs for 5 cells: space at x=0, م at x=1, لا at x=2
+    // (spanning 2-3), س at x=4.
+    _ = try shaper.shape(run1);
+    const cells = try shaper.shape(run2);
+    try testing.expectEqual(@as(usize, 4), cells.len);
+    try testing.expectEqual(@as(u16, 0), cells[0].x);
+    try testing.expectEqual(@as(u16, 1), cells[1].x);
+    try testing.expectEqual(@as(u16, 2), cells[2].x);
+    try testing.expectEqual(@as(u16, 4), cells[3].x);
+}
+
+test "shape RTL with persian digits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaperWithFont(alloc, .arabic);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 80, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // "سلام ۲۵": RTL letters, a space, and two Persian digits. Digits
+    // are weak bidi characters and must remain in left-to-right order
+    // (۲۵ is twenty-five, not fifty-two), so they are segmented into
+    // their own LTR run.
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("سلام ۲۵");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var shaper = &testdata.shaper;
+    var it = shaper.runIterator(.{
+        .grid = testdata.grid,
+        .cells = state.row_data.get(0).cells.slice(),
+    });
+
+    // Two runs: RTL "سلام " and LTR "۲۵".
+    const run1 = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.rtl, run1.direction);
+    try testing.expectEqual(@as(u16, 0), run1.offset);
+    try testing.expectEqual(@as(u16, 5), run1.cells);
+
+    const run2 = (try it.next(alloc)).?;
+    try testing.expectEqual(unicode.bidi.Direction.ltr, run2.direction);
+    try testing.expectEqual(@as(u16, 5), run2.offset);
+    try testing.expectEqual(@as(u16, 2), run2.cells);
+
+    try testing.expect((try it.next(alloc)) == null);
+
+    // The RTL run shapes into ascending cells covering its full range.
+    // CoreText forms the lam-alef ligature and places the trailing
+    // space at the visual start of the run, so we get 4 glyphs for the
+    // 5 cells: space x=0, م x=1, لا x=2 (spanning 2-3), س x=4.
+    const cells1 = try shaper.shape(run1);
+    try testing.expectEqual(@as(usize, 4), cells1.len);
+    try testing.expectEqual(@as(u16, 0), cells1[0].x);
+    try testing.expectEqual(@as(u16, 1), cells1[1].x);
+    try testing.expectEqual(@as(u16, 2), cells1[2].x);
+    try testing.expectEqual(@as(u16, 4), cells1[3].x);
+
+    // The digit run shapes LTR: ۲ then ۵ in logical order.
+    const cells2 = try shaper.shape(run2);
+    try testing.expectEqual(@as(usize, 2), cells2.len);
+    try testing.expectEqual(@as(u16, 0), cells2[0].x);
+    try testing.expectEqual(@as(u16, 1), cells2[1].x);
+}
+
 const TestShaper = struct {
     alloc: Allocator,
     shaper: Shaper,
@@ -2531,6 +2789,7 @@ const TestShaper = struct {
 };
 
 const TestFont = enum {
+    arabic,
     code_new_roman,
     geist_mono,
     inconsolata,
@@ -2548,6 +2807,7 @@ fn testShaperWithFont(alloc: Allocator, font_req: TestFont) !TestShaper {
     const testEmoji = font.embedded.emoji;
     const testEmojiText = font.embedded.emoji_text;
     const testFont = switch (font_req) {
+        .arabic => font.embedded.arabic,
         .code_new_roman => font.embedded.code_new_roman,
         .inconsolata => font.embedded.inconsolata,
         .geist_mono => font.embedded.geist_mono,
