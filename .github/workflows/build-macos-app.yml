@@ -1,0 +1,49 @@
+on:
+  workflow_dispatch: {}
+
+name: Build macOS App
+
+jobs:
+  build-macos-app:
+    runs-on: macos-15
+    env:
+      ZIG_LOCAL_CACHE_DIR: /Users/runner/zig/local-cache
+      ZIG_GLOBAL_CACHE_DIR: /Users/runner/zig/global-cache
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get Zig version
+        id: zig
+        run: |
+          echo "version=$(sed -n -E 's/^\s*\.?minimum_zig_version\s*=\s*"([^"]+)".*/\1/p' build.zig.zon)" >> $GITHUB_OUTPUT
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Build GhosttyKit
+        run: zig build -Demit-macos-app=false -Doptimize=ReleaseFast
+
+      - name: Build Ghostty.app
+        run: |
+          cd macos
+          xcodebuild -target Ghostty \
+            -configuration Release \
+            -derivedDataPath /tmp/ghostty-dd \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package Ghostty.app
+        run: |
+          APP_PATH=$(find /tmp/ghostty-dd -name "Ghostty.app" -maxdepth 4 -type d | head -1)
+          echo "Found app at: $APP_PATH"
+          cd "$(dirname "$APP_PATH")"
+          zip -r -y /tmp/Ghostty.zip Ghostty.app
+
+      - name: Upload Ghostty.app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Ghostty-macos-arm64
+          path: /tmp/Ghostty.zip
+          retention-days: 7
